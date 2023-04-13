@@ -4,3 +4,5 @@ docker-compose up
 
 docker-compose exec web python manage.py measure_cache
 docker-compose exec web python manage.py test_code
+
+redis-cli info memory

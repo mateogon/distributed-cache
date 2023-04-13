@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 from book_search.views import test_code
+from book_search import redis_instances
 
 class Command(BaseCommand):
     help = 'Measure cache performance'

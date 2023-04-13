@@ -7,10 +7,7 @@ import numpy as np
 import asyncio
 import sys
 from .olids import olids
-from .redis_instances import redis_instances
-from concurrent.futures import ThreadPoolExecutor
 
-executor = ThreadPoolExecutor()
 logger = logging.getLogger(__name__)
 
 REDIS_URL = "redis://redis"
@@ -28,7 +25,7 @@ async def get_book_details(olid):
             else:
                 print(f"Book not found for OLID {olid}")
                 return None
-'''
+
 async def get_book_details_cached(redis, olid):
     cache_key = f"book:{olid}"
 
@@ -41,43 +38,6 @@ async def get_book_details_cached(redis, olid):
     if book_details:
         await redis.set(cache_key, json.dumps(book_details))
     return book_details, False
-'''
-async def get_book_details_cached(redis, olid):
-    cache_key = f"book:{olid}"
-
-    cached_data = await redis.get(cache_key)
-    if cached_data:
-        book_details = json.loads(cached_data)
-        return book_details, True
-
-    book_details = await get_book_details(olid)
-    if book_details:
-        # Check if the key count is over the limit (e.g., 100)
-        key_count = await redis.dbsize()
-        print(f"Key count: {key_count}")
-        if key_count >= 10:
-            print("Key count is over the limit. Evicting the least recently used key.")
-            # Apply LRU eviction policy by finding the least recently used key
-            keys = await redis.keys("*")
-            least_recently_used_key = None
-            min_ttl = float("inf")
-
-            for key in keys:
-                ttl = await redis.ttl(key)
-                print(f"Key: {key}, TTL: {ttl}")
-                if ttl < min_ttl:
-                    print(f"Key {key} has the least TTL: {ttl}")
-                    min_ttl = ttl
-                    least_recently_used_key = key
-
-            # Remove the least recently used key from the cache
-            if least_recently_used_key:
-                await redis.delete(least_recently_used_key)
-
-        # Add the new key to the cache
-        await redis.set(cache_key, json.dumps(book_details), ex=3600)  # Set the TTL as required
-
-    return book_details, False
 
 def get_redis_instance(olid, redis_instances):
     olid_hash = hashlib.md5(olid.encode('utf-8')).hexdigest()
@@ -86,50 +46,41 @@ def get_redis_instance(olid, redis_instances):
     return redis_instances[instance_index]
 
 async def query_book_details(olid, redis_instances):
-    logger.info(f"Querying book details for OLID {olid}")
     target_redis = get_redis_instance(olid, redis_instances)
-    
     book_details, cache_hit = await get_book_details_cached(target_redis, olid)
-    logger.info(f"Book details for OLID {olid} retrieved from cache: {cache_hit}")
     return cache_hit
 
 async def reset_cache(redis_instances):
     tasks = [redis.flushall() for redis in redis_instances]
     await asyncio.gather(*tasks)
-
+    
 async def get_key_count(redis_instance):
-        return await redis_instance.dbsize()
+    return await redis_instance.dbsize()
 
 async def get_total_key_count(redis_instances):
     key_counts = await asyncio.gather(*[get_key_count(redis_instance) for redis_instance in redis_instances])
     return sum(key_counts)
-
-async def async_request(query_function, *args):
-    return await query_function(*args)
-
-
-def sync_request(query_function, *args):
-    loop = asyncio.get_event_loop()
-    coro = query_function(*args)
-    return asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-
-
-async def test_code(distribution='pareto', num_queries=40, use_async=True):
+    
+async def test_code(distribution='pareto', num_queries=500):
+    
     test_queries = True
     should_reset_cache = False
-
-    request = async_request if use_async else sync_request
-
+    
+    redis_instances = [
+        aioredis.from_url("redis://redis1", encoding="utf-8", decode_responses=True),
+        aioredis.from_url("redis://redis2", encoding="utf-8", decode_responses=True),
+        aioredis.from_url("redis://redis3", encoding="utf-8", decode_responses=True),
+    ]
+    
     logger.info("Starting test()")
-
+    
     if should_reset_cache:
         logger.info("Resetting cache")
         await reset_cache(redis_instances)
         total_key_count = await get_total_key_count(redis_instances)
         print(f"Total number of stored cache keys across all Redis instances after reset: {total_key_count}")
         return
-
+            
     if test_queries: # test for queries
         pareto_shape = 2
         exponential_scale = 50
@@ -153,14 +104,9 @@ async def test_code(distribution='pareto', num_queries=40, use_async=True):
         olids_sample = np.random.choice(olids, num_queries, p=normalized_probabilities)
 
         
-        logger.info(f"Querying {num_queries} books")
-        tasks = [request(query_book_details, olid, redis_instances) for olid in olids_sample]
-        logger.info(f"Waiting for {len(tasks)} tasks to complete")
-        if use_async:
-            cache_hits_list = await asyncio.gather(*tasks)
-        else:
-            with ThreadPoolExecutor() as executor:
-                cache_hits_list = list(executor.map(request, tasks))
+
+        tasks = [query_book_details(olid, redis_instances) for olid in olids_sample]
+        cache_hits_list = await asyncio.gather(*tasks)
         cache_hits = sum(cache_hits_list)
 
         cache_hit_rate = cache_hits / num_queries
@@ -186,11 +132,7 @@ async def test_code(distribution='pareto', num_queries=40, use_async=True):
 
         # Choose a sample size, e.g., 20
         sample_size = 1000
-        if use_async:
-            sample_responses = await get_sample_responses(sample_size)
-        else:
-            with ThreadPoolExecutor() as executor:
-                sample_responses = executor.submit(sync_request, get_sample_responses, sample_size).result()
+        sample_responses = await get_sample_responses(sample_size)
         response_sizes = [sys.getsizeof(json.dumps(response)) for response in sample_responses]
         
         average_response_size = sum(response_sizes) / len(response_sizes)
@@ -199,9 +141,8 @@ async def test_code(distribution='pareto', num_queries=40, use_async=True):
 
         memory_required = num_responses * average_response_size * buffer_factor
         formatted_memory_required = format_memory_size(memory_required)
-        logger.info(f"Estimated memory required for {sample_size} queries: {formatted_memory_required}")
+        print(f"Estimated memory required for {sample_size} queries: {formatted_memory_required}")
     
-    total_key_count = await get_total_key_count(redis_instances)
-    print(f"Total number of stored cache keys across all Redis instances after reset: {total_key_count}")
-        
+    #total_key_count = await get_total_key_count(redis_instances)
+    #print(f"Total number of stored cache keys across all Redis instances: {total_key_count}")
     logger.info("Finished test()")
