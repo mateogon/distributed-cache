@@ -113,8 +113,6 @@ def sync_request(query_function, *args):
     coro = query_function(*args)
     return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
-
-
 async def test_code(distribution='pareto', num_queries=40, use_async=True):
     test_queries = True
     should_reset_cache = False
