@@ -70,6 +70,7 @@ async def get_book_details_cached(redis, olid):
                 ttl = await redis.ttl(key)
                 if ttl < min_ttl:
                     min_ttl = ttl
+                    
                     least_recently_used_key = key
 
             # Remove the least recently used key from the cache
