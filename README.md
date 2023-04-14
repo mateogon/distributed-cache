@@ -17,9 +17,13 @@ To get started with the project, follow the steps below.
 
 1. Build the Docker containers:
 
+   pip install -r requirements.txt
+
+2. Build the Docker containers:
+
    docker-compose build
 
-2. Start the Docker containers:
+3. Start the Docker containers:
 
    docker-compose up
 
