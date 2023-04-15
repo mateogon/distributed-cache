@@ -29,9 +29,9 @@ To get started with the project, follow the steps below.
 
 ### Testing the cache
 
-To test the cache, run the following command:
+To test the cache, first set the parameters in the plot_test() function in view.py. Then run the following command:
 
-    docker-compose exec web python manage.py test_code
+    docker-compose exec web python manage.py plot_test
 
 ### Resetting the cache
 

@@ -9,12 +9,15 @@ import sys
 from .olids import olids
 from .redis_instances import redis_instances
 from concurrent.futures import ThreadPoolExecutor
+import timeit
+import matplotlib.pyplot as plt
 
 executor = ThreadPoolExecutor()
 logger = logging.getLogger(__name__)
 
-REDIS_URL = "redis://redis"
-
+max_cache_keys = 40 #per instance
+pareto_shape = 1.16
+exponential_scale = 50
 
 async def get_book_details(olid):
     url = f'https://openlibrary.org/works/{olid}.json'
@@ -28,20 +31,7 @@ async def get_book_details(olid):
             else:
                 print(f"Book not found for OLID {olid}")
                 return None
-'''
-async def get_book_details_cached(redis, olid):
-    cache_key = f"book:{olid}"
-
-    cached_data = await redis.get(cache_key)
-    if cached_data:
-        book_details = json.loads(cached_data)
-        return book_details, True
-
-    book_details = await get_book_details(olid)
-    if book_details:
-        await redis.set(cache_key, json.dumps(book_details))
-    return book_details, False
-'''
+            
 async def get_book_details_cached(redis, olid):
     cache_key = f"book:{olid}"
 
@@ -58,7 +48,7 @@ async def get_book_details_cached(redis, olid):
         key_count = await redis.dbsize()
         
         
-        if key_count >= 10:
+        if key_count >= max_cache_keys:
             
             print("Key count is over the limit. Evicting the least recently used key.")
             # Apply LRU eviction policy by finding the least recently used key
@@ -116,9 +106,9 @@ async def log_total_key_count(redis_instances):
     total_key_count = await get_total_key_count(redis_instances)
     logger.info(f"Total key count across all Redis instances: {total_key_count}")
     
-def generate_samples(distribution, olids, num_queries):
-    pareto_shape = 1.16
-    exponential_scale = 50
+def generate_samples(distribution, olids, num_queries,pareto_shape = 1.16,exponential_scale = 50):
+    
+    
     custom_distribution = np.random.normal
 
     distributions = {
@@ -170,7 +160,7 @@ async def estimate_memory_size():
 
 
 
-async def test_code_async(distribution='pareto', num_queries=100):
+async def test_code_async(distribution='pareto', num_queries=300):
     
     test_queries = True
     
@@ -239,3 +229,83 @@ async def test_code_sync(distribution='pareto', num_queries=100):
     await log_total_key_count(redis_instances)
         
     logger.info("Finished test()")
+    
+async def performance_test(distribution='pareto', num_queries=100, test_cached=True, test_non_cached=True, pareto_shape = 1.16,exponential_scale = 50):
+    
+    olids_sample = generate_samples(distribution, olids, num_queries,pareto_shape,exponential_scale)
+
+    # Measure the execution time of cached queries
+    count = 0
+    cache_hits = 0
+    if test_cached:
+        start_time = timeit.default_timer()
+        for olid in olids_sample:
+            cache_hit = await query_book_details(olid, redis_instances)
+            cache_hits += cache_hit
+            count += 1
+            logger.info(f"cached test: {count}/{num_queries}")
+        cached_time = timeit.default_timer() - start_time
+    else:
+        cached_time = None
+        cache_hit_rate = None
+
+    count = 0
+    non_cached_times = []
+    # Measure the execution time of non-cached queries
+    if test_non_cached:
+        start_time = timeit.default_timer()
+        for olid in olids_sample:
+            target_redis = get_redis_instance(olid, redis_instances) # because cached queries already did this
+            this_start_time = timeit.default_timer()
+            cache_hit = await get_book_details(olid)
+            execution_time = timeit.default_timer() - this_start_time
+            non_cached_times.append(execution_time)
+            count += 1
+            logger.info(f"non cached test: {count}/{num_queries}")
+        non_cached_total_time = timeit.default_timer() - start_time
+        non_cached_avg_time = np.mean(non_cached_times)
+        non_cached_std = np.std(non_cached_times)
+        print(f'non_cached_avg_time: {non_cached_avg_time} non_cached_std: {non_cached_std}')
+    else:
+        non_cached_total_time = None
+        non_cached_avg_time = None
+        non_cached_std = None
+    
+    if test_cached:
+        cache_hit_rate = cache_hits / num_queries
+        print(f"Cache hit rate: {cache_hit_rate:.2%}")
+        
+    return cached_time,non_cached_total_time, cache_hit_rate
+
+async def plot_test():
+    num_queries = 500
+    non_cached_time = num_queries * 0.843225 #await performance_test(num_queries=num_queries, test_non_cached=True, test_cached=False, pareto_shape=pareto_shapes[0])
+    pareto_shapes = [1.16, 1.5, 2, 2.5]
+    cached_time  , _ , hit_rate  = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[0])
+    cached_time1 , _ , hit_rate1 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[1])
+    cached_time2 , _ , hit_rate2 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[2])
+    cached_time3 , _ , hit_rate3 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[3])
+
+    bar_labels = [f'Cached {pareto_shapes[0]}', f'Cached {pareto_shapes[1]}', f'Cached {pareto_shapes[2]}', f'Cached {pareto_shapes[3]}','Non-cached']
+    bar_values = [cached_time, cached_time1, cached_time2, cached_time3, non_cached_time]
+    hit_rates = [hit_rate, hit_rate1, hit_rate2, hit_rate3, None]
+
+    fig, ax = plt.subplots()
+    print(bar_values)
+    bars = ax.bar(bar_labels, bar_values)
+    
+
+    ax.set_ylabel('Time (s)')
+    ax.set_title(f'Performance comparison for {num_queries} queries with {max_cache_keys} cache keys')
+
+    # Add hit rate labels above each bar
+    for i, bar in enumerate(bars):
+        if hit_rates[i] is not None:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{hit_rates[i]:.2%}", ha='center', va='bottom')
+
+    plt.savefig(f'test_{num_queries}_{max_cache_keys}.png')
+    #plt.show()
+
+
+
+
