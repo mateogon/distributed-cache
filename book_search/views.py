@@ -1,4 +1,5 @@
 import aiohttp
+import random
 import logging
 import aioredis
 import json
@@ -15,6 +16,7 @@ import matplotlib.pyplot as plt
 executor = ThreadPoolExecutor()
 logger = logging.getLogger(__name__)
 
+cache_policy = "random"
 max_cache_keys = 40 #per instance
 pareto_shape = 1.16
 exponential_scale = 50
@@ -32,46 +34,94 @@ async def get_book_details(olid):
                 print(f"Book not found for OLID {olid}")
                 return None
             
-async def get_book_details_cached(redis, olid):
+async def cache_eviction_policy(redis, policy="lru"):
+    if policy == "lru":
+        return await lru_eviction(redis)
+    elif policy == "fifo":
+        return await fifo_eviction(redis)
+    elif policy == "lfu":
+        return await lfu_eviction(redis)
+    elif policy == "random":
+        return await random_eviction(redis)
+    else:
+        raise ValueError("Unsupported cache eviction policy")
+
+async def lfu_eviction(redis):
+    keys = await redis.keys("*")
+    least_frequently_used_key = None
+    min_frequency = float("inf")
+
+    for key in keys:
+        frequency = int(await redis.object("freq", key))
+        if frequency < min_frequency:
+            min_frequency = frequency
+            least_frequently_used_key = key
+
+    if least_frequently_used_key:
+        logger.info(f"Evicting key {least_frequently_used_key} from cache (LFU)")
+        await redis.delete(least_frequently_used_key)
+
+async def lru_eviction(redis):
+    keys = await redis.keys("*")
+    least_recently_used_key = None
+    min_ttl = float("inf")
+
+    for key in keys:
+        ttl = await redis.ttl(key)
+        if ttl < min_ttl:
+            min_ttl = ttl
+            least_recently_used_key = key
+
+    if least_recently_used_key:
+        logger.info(f"Evicting key {least_recently_used_key} from cache (LRU)")
+        await redis.delete(least_recently_used_key)
+
+
+async def fifo_eviction(redis):
+    keys = await redis.keys("*")
+    oldest_key = None
+    max_ttl = -float("inf")
+
+    for key in keys:
+        ttl = await redis.ttl(key)
+        if ttl > max_ttl:
+            max_ttl = ttl
+            oldest_key = key
+
+    if oldest_key:
+        logger.info(f"Evicting key {oldest_key} from cache (FIFO)")
+        await redis.delete(oldest_key)
+
+async def random_eviction(redis):
+    keys = await redis.keys("*")
+
+    if keys:
+        random_key = random.choice(keys)
+        logger.info(f"Evicting key {random_key} from cache (Random)")
+        await redis.delete(random_key)
+
+async def get_book_details_cached(redis, olid, cache_policy="lru"):
     cache_key = f"book:{olid}"
 
     cached_data = await redis.get(cache_key)
-    
+
     if cached_data:
         book_details = json.loads(cached_data)
         return book_details, True
 
     book_details = await get_book_details(olid)
-    
+
     if book_details:
-        # Check if the key count is over the limit (e.g., 100)
         key_count = await redis.dbsize()
-        
-        
+
         if key_count >= max_cache_keys:
-            
-            print("Key count is over the limit. Evicting the least recently used key.")
-            # Apply LRU eviction policy by finding the least recently used key
-            keys = await redis.keys("*")
-            least_recently_used_key = None
-            min_ttl = float("inf")
+            print("Key count is over the limit. Evicting based on cache policy.")
+            await cache_eviction_policy(redis, policy=cache_policy)
 
-            for key in keys:
-                ttl = await redis.ttl(key)
-                if ttl < min_ttl:
-                    min_ttl = ttl
-                    
-                    least_recently_used_key = key
+        await redis.set(cache_key, json.dumps(book_details), ex=3600)
 
-            # Remove the least recently used key from the cache
-            if least_recently_used_key:
-                logger.info(f"Evicting key {least_recently_used_key} from cache")
-                await redis.delete(least_recently_used_key)
-
-        # Add the new key to the cache
-        await redis.set(cache_key, json.dumps(book_details), ex=3600)  # Set the TTL as required
-    
     return book_details, False
+
 
 def get_redis_instance(olid, redis_instances):
     
@@ -80,10 +130,10 @@ def get_redis_instance(olid, redis_instances):
     logger.info(f"OLID {olid} goes to instance {instance_index}")
     return redis_instances[instance_index]
 
-async def query_book_details(olid, redis_instances):
+async def query_book_details(olid, redis_instances, cache_policy="lru"):
     
     target_redis = get_redis_instance(olid, redis_instances)
-    book_details, cache_hit = await get_book_details_cached(target_redis, olid)
+    book_details, cache_hit = await get_book_details_cached(target_redis, olid, cache_policy)
     logger.info(f"Book details for OLID {olid} retrieved from cache: {cache_hit}")
     return cache_hit
 
@@ -160,7 +210,7 @@ async def estimate_memory_size():
 
 
 
-async def test_code_async(distribution='pareto', num_queries=300):
+async def test_code_async(distribution='pareto',cache_policy = "lru", num_queries=300):
     
     test_queries = True
     
@@ -180,7 +230,7 @@ async def test_code_async(distribution='pareto', num_queries=300):
         
         olids_sample = generate_samples(distribution, olids, num_queries)
 
-        tasks = [query_book_details(olid, redis_instances) for olid in olids_sample]
+        tasks = [query_book_details(olid, redis_instances,cache_policy = cache_policy) for olid in olids_sample]
         cache_hits_list = await asyncio.gather(*tasks)
         cache_hits = sum(cache_hits_list)
 
@@ -195,7 +245,7 @@ async def test_code_async(distribution='pareto', num_queries=300):
         
     logger.info("Finished test()")
 
-async def test_code_sync(distribution='pareto', num_queries=100):
+async def test_code_sync(distribution='pareto',cache_policy = "lru", num_queries=100):
     
     test_queries = True
     
@@ -215,7 +265,7 @@ async def test_code_sync(distribution='pareto', num_queries=100):
 
         cache_hits = 0
         for olid in olids_sample:
-            cache_hit = await query_book_details(olid, redis_instances)
+            cache_hit = await query_book_details(olid, redis_instances, cache_policy = cache_policy)
             cache_hits += cache_hit
 
         cache_hit_rate = cache_hits / num_queries
@@ -230,7 +280,7 @@ async def test_code_sync(distribution='pareto', num_queries=100):
         
     logger.info("Finished test()")
     
-async def performance_test(distribution='pareto', num_queries=100, test_cached=True, test_non_cached=True, pareto_shape = 1.16,exponential_scale = 50):
+async def performance_test(distribution='pareto',cache_policy="lru", num_queries=100, test_cached=True, test_non_cached=True, pareto_shape = 1.16,exponential_scale = 50):
     
     olids_sample = generate_samples(distribution, olids, num_queries,pareto_shape,exponential_scale)
 
@@ -240,7 +290,7 @@ async def performance_test(distribution='pareto', num_queries=100, test_cached=T
     if test_cached:
         start_time = timeit.default_timer()
         for olid in olids_sample:
-            cache_hit = await query_book_details(olid, redis_instances)
+            cache_hit = await query_book_details(olid, redis_instances,cache_policy)
             cache_hits += cache_hit
             count += 1
             logger.info(f"cached test: {count}/{num_queries}")
@@ -281,10 +331,10 @@ async def plot_test():
     num_queries = 500
     non_cached_time = num_queries * 0.843225 #await performance_test(num_queries=num_queries, test_non_cached=True, test_cached=False, pareto_shape=pareto_shapes[0])
     pareto_shapes = [1.16, 1.5, 2, 2.5]
-    cached_time  , _ , hit_rate  = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[0])
-    cached_time1 , _ , hit_rate1 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[1])
-    cached_time2 , _ , hit_rate2 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[2])
-    cached_time3 , _ , hit_rate3 = await performance_test(num_queries=num_queries, test_non_cached=False, pareto_shape=pareto_shapes[3])
+    cached_time  , _ , hit_rate  = await performance_test(num_queries=num_queries,cache_policy = cache_policy, test_non_cached=False, pareto_shape=pareto_shapes[0])
+    cached_time1 , _ , hit_rate1 = await performance_test(num_queries=num_queries,cache_policy = cache_policy, test_non_cached=False, pareto_shape=pareto_shapes[1])
+    cached_time2 , _ , hit_rate2 = await performance_test(num_queries=num_queries,cache_policy = cache_policy, test_non_cached=False, pareto_shape=pareto_shapes[2])
+    cached_time3 , _ , hit_rate3 = await performance_test(num_queries=num_queries,cache_policy = cache_policy, test_non_cached=False, pareto_shape=pareto_shapes[3])
 
     bar_labels = [f'Cached {pareto_shapes[0]}', f'Cached {pareto_shapes[1]}', f'Cached {pareto_shapes[2]}', f'Cached {pareto_shapes[3]}','Non-cached']
     bar_values = [cached_time, cached_time1, cached_time2, cached_time3, non_cached_time]
@@ -296,14 +346,14 @@ async def plot_test():
     
 
     ax.set_ylabel('Time (s)')
-    ax.set_title(f'Performance comparison for {num_queries} queries with {max_cache_keys} cache keys')
+    ax.set_title(f'{num_queries} queries with {max_cache_keys} cache keys {cache_policy} cache policy')
 
     # Add hit rate labels above each bar
     for i, bar in enumerate(bars):
         if hit_rates[i] is not None:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{hit_rates[i]:.2%}", ha='center', va='bottom')
 
-    plt.savefig(f'test_{num_queries}_{max_cache_keys}.png')
+    plt.savefig(f'{num_queries}_{cache_policy}_{max_cache_keys}.png')
     #plt.show()
 
 
