@@ -10,6 +10,7 @@ import sys
 from .olids import olids
 from .redis_instances import redis_instances
 from concurrent.futures import ThreadPoolExecutor
+from django.http import HttpResponse
 import timeit
 import matplotlib.pyplot as plt
 
@@ -20,6 +21,18 @@ cache_policy = "random"
 max_cache_keys = 40 #per instance
 pareto_shape = 1.16
 exponential_scale = 50
+
+async def book_details_view(request, olid):
+    target_redis = get_redis_instance(olid, redis_instances)
+    book_details, _ = await get_book_details_cached(target_redis, olid, cache_policy)
+
+    if book_details:
+        response_data = json.dumps(book_details)
+        return HttpResponse(response_data, content_type='application/json')
+    else:
+        response_data = json.dumps({"error": "Book details not found."})
+        return HttpResponse(response_data, content_type='application/json', status=404)
+
 
 async def get_book_details(olid):
     url = f'https://openlibrary.org/works/{olid}.json'
@@ -328,7 +341,7 @@ async def performance_test(distribution='pareto',cache_policy="lru", num_queries
     return cached_time,non_cached_total_time, cache_hit_rate
 
 async def plot_test():
-    num_queries = 500
+    num_queries = 10
     non_cached_time = num_queries * 0.843225 #await performance_test(num_queries=num_queries, test_non_cached=True, test_cached=False, pareto_shape=pareto_shapes[0])
     pareto_shapes = [1.16, 1.5, 2, 2.5]
     cached_time  , _ , hit_rate  = await performance_test(num_queries=num_queries,cache_policy = cache_policy, test_non_cached=False, pareto_shape=pareto_shapes[0])
